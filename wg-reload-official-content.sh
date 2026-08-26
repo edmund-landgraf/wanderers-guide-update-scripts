@@ -173,13 +173,38 @@ backup_live() {
 # (auth.identities / auth.users / auth.refresh_tokens → SQLSTATE 42501).
 # We dump auth for emergency use but roll back public only.
 restore_live() {
+  trap - ERR
   log "ROLLBACK pg_restore --clean --if-exists -n public $BACKUP_PATH"
   local remote="/tmp/wg-pre-content.dump"
   docker cp "$BACKUP_PATH_DOCKER" "$CONTAINER:$remote"
+  # auth.users trigger depends on public.handle_new_auth_user; --clean cannot
+  # DROP the function until the trigger is gone. repair_supabase_privileges
+  # reinstalls it from data/auth-trigger.sql.
+  docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$LIVE_DB" -v ON_ERROR_STOP=1 -c \
+    "DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;"
+  set +e
   docker exec "$CONTAINER" pg_restore -U "$DB_USER" -d "$LIVE_DB" --clean --if-exists --no-owner --no-acl -n public "$remote"
+  set -e
   docker exec "$CONTAINER" rm -f "$remote"
   repair_supabase_privileges
   log "ROLLBACK restore finished counts=$(count_sources "$LIVE_DB")"
+}
+
+CONTENT_SWAP_COMMITTED=0
+
+# Always exit. Git Bash + ERR traps treat `return` as top-level (not in a function).
+rollback_or_die() {
+  trap - ERR
+  if [[ "${CONTENT_SWAP_COMMITTED}" == "1" ]]; then
+    log "swap already committed; not restoring pre-apply dump"
+    exit 1
+  fi
+  if restore_live; then
+    log "ROLLBACK ok; user/character data should match pre-apply backup"
+    exit 1
+  fi
+  log "FATAL ROLLBACK FAILED. Leave $BACKUP_PATH intact and restore manually: pg_restore --clean --if-exists"
+  exit 2
 }
 
 # Recreate PostgREST + GoTrue privileges that --no-acl restore (or a bad
@@ -257,11 +282,53 @@ RESET ROLE;
 SQL
 }
 
+# Supabase's postgres role is often not a superuser, so pg_terminate_backend
+# on autovacuum / supabase_admin fails with "must be a superuser to terminate
+# superuser process" and ON_ERROR_STOP aborts DROP DATABASE.
+drop_database_if_exists() {
+  local dbname="$1"
+  local attempt out code
+  for attempt in 1 2 3 4 5 6 7 8; do
+    set +e
+    docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$LIVE_DB" -v ON_ERROR_STOP=1 <<SQL >/dev/null
+SELECT pg_terminate_backend(a.pid)
+FROM pg_stat_activity a
+LEFT JOIN pg_roles r ON r.oid = a.usesysid
+WHERE a.datname = '$dbname'
+  AND a.pid <> pg_backend_pid()
+  AND (
+    EXISTS (SELECT 1 FROM pg_roles me WHERE me.rolname = current_user AND me.rolsuper)
+    OR (
+      COALESCE(r.rolsuper, false) = false
+      AND COALESCE(a.backend_type, 'client backend') = 'client backend'
+    )
+  );
+SQL
+    set -e
+    set +e
+    out="$(docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$LIVE_DB" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${dbname};" 2>&1)"
+    code=$?
+    set -e
+    printf '%s\n' "$out"
+    # Windows docker→PowerShell often yields a non-zero exit (RemoteException) even
+    # when DROP DATABASE succeeded. Trust the SQL output, not docker's exit code.
+    if grep -q 'DROP DATABASE' <<<"$out" && ! grep -q '^ERROR:' <<<"$out"; then
+      return 0
+    fi
+    if [[ "$code" -eq 0 ]] && ! grep -q '^ERROR:' <<<"$out"; then
+      return 0
+    fi
+    log "drop $dbname attempt $attempt failed: $out"
+    sleep 1
+  done
+  log "FAIL could not drop database $dbname"
+  return 1
+}
+
 load_stage_db() {
   log "recreate database $STAGE_DB"
+  drop_database_if_exists "$STAGE_DB"
   docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$LIVE_DB" -v ON_ERROR_STOP=1 <<SQL
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$STAGE_DB';
-DROP DATABASE IF EXISTS $STAGE_DB;
 CREATE DATABASE $STAGE_DB;
 SQL
 
@@ -432,10 +499,7 @@ replay_migrations() {
 }
 
 drop_stage() {
-  docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$LIVE_DB" -v ON_ERROR_STOP=1 <<SQL
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$STAGE_DB';
-DROP DATABASE IF EXISTS $STAGE_DB;
-SQL
+  drop_database_if_exists "$STAGE_DB"
 }
 
 if [[ "$REPAIR_ONLY" == "1" ]]; then
@@ -472,15 +536,7 @@ need_restore=1
 step 2 "$TOTAL" backup OK
 
 step 3 "$TOTAL" stage START
-rollback_or_die() {
-  if restore_live; then
-    log "ROLLBACK ok; user/character data should match pre-apply backup"
-    return 0
-  fi
-  log "FATAL ROLLBACK FAILED. Leave $BACKUP_PATH intact and restore manually: pg_restore --clean --if-exists"
-  exit 2
-}
-trap 'log "unhandled error; restoring backup"; rollback_or_die; exit 1' ERR
+trap 'log "unhandled error; restoring backup"; rollback_or_die' ERR
 
 if ! load_stage_db; then
   step 3 "$TOTAL" stage FAIL
@@ -519,14 +575,21 @@ if ! assert_user_data_unchanged "$USER_FP" after-migrations; then
 fi
 step 5 "$TOTAL" migrations OK
 
+CONTENT_SWAP_COMMITTED=1
+trap - ERR
+
 step 6 "$TOTAL" drop_stage START
-drop_stage
-step 6 "$TOTAL" drop_stage OK
+if drop_stage; then
+  step 6 "$TOTAL" drop_stage OK
+else
+  log "WARN leftover database $STAGE_DB after committed swap; drop it later"
+  step 6 "$TOTAL" drop_stage OK "leftover $STAGE_DB"
+fi
 
 step 7 "$TOTAL" verify_user_data START
 if ! assert_user_data_unchanged "$USER_FP" after-commit; then
   step 7 "$TOTAL" verify_user_data FAIL
-  rollback_or_die
+  log "user data fingerprint changed after committed swap; not restoring dump"
   exit 1
 fi
 step 7 "$TOTAL" verify_user_data OK "user/character/campaign/encounter/homebrew unchanged"
@@ -535,7 +598,7 @@ step 8 "$TOTAL" repair_grants START
 repair_supabase_privileges
 if ! assert_auth_access; then
   step 8 "$TOTAL" repair_grants FAIL
-  rollback_or_die
+  log "grant repair failed after committed swap; not restoring dump"
   exit 1
 fi
 step 8 "$TOTAL" repair_grants OK "supabase_auth_admin can read auth.identities"

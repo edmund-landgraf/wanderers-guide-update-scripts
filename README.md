@@ -7,9 +7,9 @@ The scripts are intended to separate **official content updates** from **applica
 ## Scripts
 
 - `update-wg-content.sh` — applies official-content updates and catches up from the last successfully applied state. Supports an optional `--since` override.
-- `update-wg-non-content.sh` — updates non-content/application changes. *(Add the companion script from your deployment.)*
-- `wg-update-common.sh` — shared update, state, backup, Git, and database helper functions. *(Required by the update wrappers.)*
-- `wg-reload-official-content.sh` — performs the protected official-content reload while preserving user-owned data. *(Required for content updates.)*
+- `update-wg-non-content.sh` — rebuilds the WG frontend for non-dump commits (`docker compose up -d --build frontend`). Use `--force` to rebuild even when git is already current.
+- `wg-update-common.sh` — shared update, state, backup, Git, and database helper functions.
+- `wg-reload-official-content.sh` — swaps official catalog rows only (does not drop `public`). After a committed swap it will not restore the pre-apply dump or `git reset` to the old SHA.
 
 ## Installation
 
@@ -65,13 +65,11 @@ Other supported options include:
 
 ## Non-content update
 
-Once `update-wg-non-content.sh` and `wg-update-common.sh` are present:
-
 ```bash
 WG_UPDATE_LOG_DIR="$HOME/logs/wg-update" \
   ~/wg-update-scripts/update-wg-non-content.sh \
   --src "$HOME/wanderers-guide" \
-  --yes
+  --force
 ```
 
 Application/code updates may require rebuilding or restarting the Wanderer's Guide Docker stack depending on what changed.
@@ -112,4 +110,4 @@ Do not substitute a destructive full database initialization for the protected o
 
 ## Current repository status
 
-The public repository currently contains the exact `update-wg-content.sh` wrapper from the working deployment. The companion `update-wg-non-content.sh`, `wg-update-common.sh`, and `wg-reload-official-content.sh` should be copied from the working server before this package is considered complete.
+This repository includes the four Linux scripts (`update-wg-content.sh`, `update-wg-non-content.sh`, `wg-update-common.sh`, `wg-reload-official-content.sh`). On a host where Wanderer's Guide is at `/opt/wanderers-guide`, use `--src /opt/wanderers-guide`.

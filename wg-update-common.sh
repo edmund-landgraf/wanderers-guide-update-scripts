@@ -8,12 +8,20 @@ amba_root() {
   cd "$here/../.." && pwd
 }
 
+# When scripts live in AdventureMakerByAct/scripts/linux, logs go in that repo.
+# When copied to ~/wg-update-scripts on the WG box, use $HOME/logs/wg-update.
 log_dir() {
   if [[ -n "${WG_UPDATE_LOG_DIR:-}" ]]; then
     printf '%s\n' "$WG_UPDATE_LOG_DIR"
-  else
-    printf '%s\n' "$(amba_root)/logs/wg-update"
+    return 0
   fi
+  local root
+  root="$(amba_root)"
+  if [[ -f "$root/package.json" && -d "$root/src" ]]; then
+    printf '%s\n' "$root/logs/wg-update"
+    return 0
+  fi
+  printf '%s\n' "${HOME}/logs/wg-update"
 }
 
 init_log_dir() {
@@ -365,7 +373,7 @@ pause_check() {
   printf '\n'
   printf '%s\n' "$prompt"
   debug_log "$debug" "pause: $prompt"
-  read -r -p "Press Enter to continue, or Ctrl+C to abort " </dev/tty
+  read -r -p "Press Enter to continue, or Ctrl+C to abort "
 }
 
 show_last_content_update() {
@@ -650,15 +658,25 @@ run_wg_update() {
 
   step_log "$debug" 5 "$total" apply START
   if [[ "$kind" == "content" ]]; then
-    local backup
+    local backup apply_out apply_code
     backup="$dir/backups/$(date -u +"%Y%m%dT%H%M%SZ")-pre-content.dump"
     mkdir -p "$dir/backups"
-    local apply_out
-    if ! apply_out="$(WG_SRC="$src" WG_BACKUP_PATH="$backup" WG_DEBUG_LOG="$debug" "$here/wg-reload-official-content.sh" 2>&1)"; then
-      debug_log "$debug" "$apply_out"
+    set +e
+    apply_out="$(WG_SRC="$src" WG_BACKUP_PATH="$backup" WG_DEBUG_LOG="$debug" "$here/wg-reload-official-content.sh" 2>&1)"
+    apply_code=$?
+    set -e
+    printf '%s\n' "$apply_out"
+    debug_log_file "$debug" "$apply_out"
+    # Reload already committed the catalog. Do not git-reset to the old dump SHA.
+    if [[ "$apply_code" -eq 0 ]] || grep -q 'DONE official content reload' <<<"$apply_out"; then
+      detail="swapped official content; user data preserved; backup=$backup"
+    else
       step_log "$debug" 5 "$total" apply FAIL
       step_log "$debug" 6 "$total" rollback START
-      if git_rollback "$src" "$old_sha" "$debug"; then
+      if grep -qE 'STEP 5/8 OK migrations|swap already committed' <<<"$apply_out"; then
+        rb_json='{"attempted":false,"ok":null,"detail":"swap committed; skipped git reset"}'
+        step_log "$debug" 6 "$total" rollback OK "skipped; catalog already swapped"
+      elif git_rollback "$src" "$old_sha" "$debug"; then
         rb_json='{"attempted":true,"ok":true,"detail":"git reset; DB restore inside wg-reload-official-content.sh"}'
         step_log "$debug" 6 "$total" rollback OK
       else
@@ -671,10 +689,8 @@ run_wg_update() {
       append_history "$(build_history_json "$ts" "$host" "$kind" "$source" "$base_since" "$base_sha" "$old_sha" "$new_sha" "$result" "$detail" "$commits_raw" "$steps_json" "$rb_json")"
       return 1
     fi
-    debug_log "$debug" "$apply_out"
-    detail="swapped official content; user data preserved; backup=$backup"
   else
-    local before after prev_id prev_name
+    local before after prev_id prev_name apply_out apply_code
     before="$(frontend_image "$src" || true)"
     prev_id="${before%% *}"
     prev_name="${before#* }"
@@ -682,9 +698,13 @@ run_wg_update() {
     if [[ -n "$prev_id" ]]; then
       docker tag "$prev_id" wg-frontend-prev:local 2>&1 | tee -a "$debug" || true
     fi
-    local apply_out
-    if ! apply_out="$(docker compose -f "$src/docker-compose.yml" --project-directory "$src" up -d --build frontend 2>&1)"; then
-      debug_log "$debug" "$apply_out"
+    set +e
+    apply_out="$(docker compose -f "$src/docker-compose.yml" --project-directory "$src" up -d --build frontend 2>&1)"
+    apply_code=$?
+    set -e
+    printf '%s\n' "$apply_out"
+    debug_log_file "$debug" "$apply_out"
+    if [[ "$apply_code" -ne 0 ]]; then
       step_log "$debug" 5 "$total" apply FAIL
       step_log "$debug" 6 "$total" rollback START
       local img_ok=1 git_ok=1
@@ -705,7 +725,6 @@ run_wg_update() {
       append_history "$(build_history_json "$ts" "$host" "$kind" "$source" "$base_since" "$base_sha" "$old_sha" "$new_sha" "$result" "$detail" "$commits_raw" "$steps_json" "$rb_json")"
       return 1
     fi
-    debug_log "$debug" "$apply_out"
     after="$(frontend_image "$src" || true)"
     debug_log "$debug" "frontend after $after"
     detail="rebuilt frontend $before -> $after"

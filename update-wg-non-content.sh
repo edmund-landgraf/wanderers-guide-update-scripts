@@ -3,6 +3,7 @@
 #
 #   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide
 #   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --force
+#   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --yes
 #   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --since 2026-08-02
 set -euo pipefail
 
