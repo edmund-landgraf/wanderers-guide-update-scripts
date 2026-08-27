@@ -344,10 +344,30 @@ load_stage_db() {
 CREATE DATABASE $STAGE_DB;
 SQL
 
+  log "prepare Supabase-compatible staging roles and schemas"
   docker exec -i "$CONTAINER" psql -U "$DB_USER" -d "$STAGE_DB" -v ON_ERROR_STOP=1 <<'SQL'
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'github') THEN
-    CREATE ROLE github;
+DO $$
+DECLARE
+  role_name text;
+BEGIN
+  FOREACH role_name IN ARRAY ARRAY[
+    'anon',
+    'authenticated',
+    'service_role',
+    'supabase_auth_admin',
+    'github'
+  ]
+  LOOP
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = role_name) THEN
+      EXECUTE format('CREATE ROLE %I', role_name);
+    END IF;
+  END LOOP;
+END $$;
+CREATE SCHEMA IF NOT EXISTS auth;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_auth_admin') THEN
+    ALTER SCHEMA auth OWNER TO supabase_auth_admin;
   END IF;
 END $$;
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
