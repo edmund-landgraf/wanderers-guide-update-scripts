@@ -36,9 +36,13 @@ REPAIR_GRANTS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --src) SRC="$2"; shift 2 ;;
+    --src)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--src requires a path" >&2; exit 2; }
+      SRC="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
-    --since) SINCE="$2"; shift 2 ;;
+    --since)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--since requires a date or commit SHA" >&2; exit 2; }
+      SINCE="$2"; shift 2 ;;
     --yes|-y) YES=1; shift ;;
     --repair-grants) REPAIR_GRANTS=1; shift ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;

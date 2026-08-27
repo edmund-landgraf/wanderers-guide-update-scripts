@@ -58,6 +58,14 @@ CONTENT_TABLES=(
   content_update
 )
 
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Required command not found: $cmd" >&2
+    return 1
+  }
+}
+
 log() {
   local line="[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*"
   printf '%s\n' "$line"
@@ -287,6 +295,10 @@ SQL
 # superuser process" and ON_ERROR_STOP aborts DROP DATABASE.
 drop_database_if_exists() {
   local dbname="$1"
+  [[ "$dbname" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || {
+    log "FAIL invalid database name: $dbname"
+    return 1
+  }
   local attempt out code
   for attempt in 1 2 3 4 5 6 7 8; do
     set +e
@@ -503,6 +515,7 @@ drop_stage() {
 }
 
 if [[ "$REPAIR_ONLY" == "1" ]]; then
+  require_cmd docker
   step 1 2 assert_container START
   assert_container
   step 1 2 assert_container OK "container=$CONTAINER"
@@ -516,6 +529,22 @@ fi
 
 if [[ -z "$BACKUP_PATH" ]]; then
   log "FAIL WG_BACKUP_PATH is required for a content reload"
+  exit 1
+fi
+
+require_cmd docker
+require_cmd sed
+require_cmd wc
+require_cmd tr
+require_cmd grep
+require_cmd mktemp
+
+if [[ -z "$SRC" || ! -d "$SRC" ]]; then
+  log "FAIL WG_SRC is not a directory: $SRC"
+  exit 1
+fi
+if [[ ! -f "$DATA_DIR/schema.sql" || ! -f "$DATA_DIR/data.sql" ]]; then
+  log "FAIL WG data dumps not found under $DATA_DIR"
   exit 1
 fi
 

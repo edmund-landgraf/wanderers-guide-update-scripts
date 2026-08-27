@@ -51,6 +51,29 @@ debug_log_file() {
   printf '%s\n' "$line" >>"$file"
 }
 
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Required command not found: $cmd" >&2
+    return 1
+  }
+}
+
+assert_update_prereqs() {
+  local kind="$1"
+  require_cmd git
+  require_cmd docker
+  require_cmd python3
+  require_cmd grep
+  require_cmd sed
+  require_cmd head
+  require_cmd mktemp
+  if [[ "$kind" == "content" ]]; then
+    require_cmd wc
+    require_cmd tr
+  fi
+}
+
 git_c() {
   local src="$1"
   shift
@@ -536,6 +559,15 @@ repair_wg_grants() {
 
 run_wg_update() {
   local src="$1" kind="$2" force="${3:-0}" since_override="${4:-}" yes="${5:-0}"
+  case "$kind" in
+    content|non-content) ;;
+    *) echo "Invalid update kind: $kind" >&2; return 2 ;;
+  esac
+  assert_update_prereqs "$kind"
+  if [[ -z "$src" || ! -d "$src" ]]; then
+    echo "WG source not found: $src" >&2
+    return 1
+  fi
   src="$(cd "$src" && pwd)"
   local dir debug
   dir="$(init_log_dir)"
