@@ -270,9 +270,45 @@ step_log() {
   debug_log "$file" "STEP $n/$total $status $name $*"
 }
 
+# skip-worktree / assume-unchanged files (local OAuth overlay, etc.) are not
+# in git status, and reset/merge can still replace them. Copy them aside first.
+save_index_overlay() {
+  local src="$1" dest="$2"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  local line flag path
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    flag="${line:0:1}"
+    path="${line:2}"
+    [[ "$flag" == "S" || "$flag" == "H" ]] || continue
+    mkdir -p "$dest/$(dirname "$path")"
+    cp -a "$src/$path" "$dest/$path"
+    printf '%s\t%s\n' "$flag" "$path" >>"$dest/flags.tsv"
+  done < <(git_c "$src" ls-files -v)
+}
+
+restore_index_overlay() {
+  local src="$1" dest="$2"
+  [[ -f "$dest/flags.tsv" ]] || return 0
+  local flag path
+  while IFS=$'\t' read -r flag path; do
+    [[ -n "$path" && -f "$dest/$path" ]] || continue
+    mkdir -p "$src/$(dirname "$path")"
+    cp -a "$dest/$path" "$src/$path"
+    if [[ "$flag" == "S" ]]; then
+      git_c "$src" update-index --skip-worktree -- "$path"
+    else
+      git_c "$src" update-index --assume-unchanged -- "$path"
+    fi
+  done <"$dest/flags.tsv"
+}
+
 git_rollback() {
   local src="$1" old_sha="$2" debug="$3"
-  local env_file="$src/.env" env_bak=""
+  local env_file="$src/.env" env_bak="" overlay
+  overlay="$(mktemp -d)"
+  save_index_overlay "$src" "$overlay"
   if [[ -f "$env_file" ]]; then
     env_bak="$(mktemp)"
     cp "$env_file" "$env_bak"
@@ -281,6 +317,8 @@ git_rollback() {
   local out
   if ! out="$(git_c "$src" reset --hard "$old_sha" 2>&1)"; then
     debug_log "$debug" "$out"
+    restore_index_overlay "$src" "$overlay"
+    rm -rf "$overlay"
     [[ -n "$env_bak" ]] && rm -f "$env_bak"
     return 1
   fi
@@ -289,6 +327,81 @@ git_rollback() {
     cp "$env_bak" "$env_file"
     rm -f "$env_bak"
   fi
+  restore_index_overlay "$src" "$overlay"
+  rm -rf "$overlay"
+  return 0
+}
+
+migrations_ledger_path() {
+  printf '%s\n' "$(init_log_dir)/applied-migrations.txt"
+}
+
+# Prints pending supabase/migrations/*.sql paths, one per line.
+# With no successful content baseline, records every current file as already
+# applied and prints nothing (does not replay historical migrations).
+pending_migration_files() {
+  local src="$1"
+  local ledger sha files
+  ledger="$(migrations_ledger_path)"
+  touch "$ledger"
+  sha="$(last_successful_history content | python3 -c 'import json,sys
+raw=sys.stdin.read().strip()
+if not raw:
+    print("")
+else:
+    row=json.loads(raw)
+    print(row.get("newSha") or row.get("oldSha") or "")')"
+  if [[ -z "$sha" ]] || ! git_c "$src" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    if [[ ! -s "$ledger" ]]; then
+      files="$(git_c "$src" ls-files 'supabase/migrations/*.sql')"
+      if [[ -n "$files" ]]; then
+        printf '%s\n' "$files" >>"$ledger"
+        sort -u "$ledger" -o "$ledger"
+      fi
+      return 0
+    fi
+    sha=""
+  fi
+  if [[ -n "$sha" ]]; then
+    git_c "$src" diff --name-only --diff-filter=AM "$sha" HEAD -- 'supabase/migrations/*.sql'
+  else
+    git_c "$src" ls-files 'supabase/migrations/*.sql'
+  fi | while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    grep -Fxq "$path" "$ledger" && continue
+    printf '%s\n' "$path"
+  done
+}
+
+apply_pending_migrations() {
+  local src="$1" debug="$2"
+  local pending path container out code applied=0
+  container="${WG_DB_CONTAINER:-wanderers-guide-db-1}"
+  pending="$(pending_migration_files "$src" || true)"
+  if [[ -z "$pending" ]]; then
+    debug_log "$debug" "migrations: none pending"
+    printf '%s\n' "migrations: none pending"
+    return 0
+  fi
+  debug_log "$debug" "migrations pending:"$'\n'"$pending"
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    debug_log "$debug" "APPLY migration $path"
+    printf 'Applying %s\n' "$path"
+    set +e
+    out="$(docker exec -i "$container" psql -U "${DB_USER:-postgres}" -d "${LIVE_DB:-postgres}" -v ON_ERROR_STOP=1 <"$src/$path" 2>&1)"
+    code=$?
+    set -e
+    printf '%s\n' "$out"
+    debug_log_file "$debug" "$out"
+    if [[ "$code" -ne 0 ]]; then
+      debug_log "$debug" "migration failed: $path"
+      return 1
+    fi
+    printf '%s\n' "$path" >>"$(migrations_ledger_path)"
+    applied=$((applied + 1))
+  done <<<"$pending"
+  debug_log "$debug" "migrations applied=$applied"
   return 0
 }
 
@@ -642,8 +755,12 @@ run_wg_update() {
   fi
 
   step_log "$debug" 4 "$total" merge START
-  local merge_out
+  local merge_out overlay
+  overlay="$(mktemp -d)"
+  save_index_overlay "$src" "$overlay"
   if ! merge_out="$(git_c "$src" merge --ff-only origin/main 2>&1)"; then
+    restore_index_overlay "$src" "$overlay"
+    rm -rf "$overlay"
     new_sha="$(head_sha "$src")"
     result="failed"
     detail="ff-only merge failed: $merge_out"
@@ -653,6 +770,8 @@ run_wg_update() {
     return 1
   fi
   debug_log "$debug" "git merge --ff-only origin/main"$'\n'"$merge_out"
+  restore_index_overlay "$src" "$overlay"
+  rm -rf "$overlay"
   new_sha="$(head_sha "$src")"
   step_log "$debug" 4 "$total" merge OK "HEAD $old_sha -> $new_sha"
 
@@ -690,6 +809,22 @@ run_wg_update() {
       return 1
     fi
   else
+    if ! apply_pending_migrations "$src" "$debug"; then
+      step_log "$debug" 5 "$total" apply FAIL
+      step_log "$debug" 6 "$total" rollback START
+      if git_rollback "$src" "$old_sha" "$debug"; then
+        rb_json='{"attempted":true,"ok":true,"detail":"git reset after migration failure"}'
+        step_log "$debug" 6 "$total" rollback OK
+      else
+        rb_json='{"attempted":true,"ok":false,"detail":"git reset failed after migration failure"}'
+        step_log "$debug" 6 "$total" rollback FAIL
+      fi
+      result="failed"
+      detail="pending supabase/migrations failed"
+      new_sha="$(head_sha "$src")"
+      append_history "$(build_history_json "$ts" "$host" "$kind" "$source" "$base_since" "$base_sha" "$old_sha" "$new_sha" "$result" "$detail" "$commits_raw" "$steps_json" "$rb_json")"
+      return 1
+    fi
     local before after prev_id prev_name apply_out apply_code
     before="$(frontend_image "$src" || true)"
     prev_id="${before%% *}"
