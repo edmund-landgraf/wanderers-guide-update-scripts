@@ -304,7 +304,10 @@ save_index_overlay() {
     [[ -z "$line" ]] && continue
     flag="${line:0:1}"
     path="${line:2}"
-    [[ "$flag" == "S" || "$flag" == "H" ]] || continue
+    # git ls-files -v: H/S are ordinary cached and skip-worktree tags.
+    # Lowercase means assume-unchanged (h) or assume-unchanged skip-worktree (s).
+    # Saving every H entry copies the whole tree and restores it after reset.
+    [[ "$flag" == "h" || "$flag" == "s" || "$flag" == "S" ]] || continue
     mkdir -p "$dest/$(dirname "$path")"
     cp -a "$src/$path" "$dest/$path"
     printf '%s\t%s\n' "$flag" "$path" >>"$dest/flags.tsv"
@@ -319,9 +322,10 @@ restore_index_overlay() {
     [[ -n "$path" && -f "$dest/$path" ]] || continue
     mkdir -p "$src/$(dirname "$path")"
     cp -a "$dest/$path" "$src/$path"
-    if [[ "$flag" == "S" ]]; then
+    if [[ "$flag" == "S" || "$flag" == "s" ]]; then
       git_c "$src" update-index --skip-worktree -- "$path"
-    else
+    fi
+    if [[ "$flag" == "h" || "$flag" == "s" ]]; then
       git_c "$src" update-index --assume-unchanged -- "$path"
     fi
   done <"$dest/flags.tsv"
