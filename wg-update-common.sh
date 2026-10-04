@@ -331,6 +331,20 @@ restore_index_overlay() {
   done <"$dest/flags.tsv"
 }
 
+# ff-only refuses to overwrite a skip-worktree worktree file even when status is clean.
+# Put the index blob back for the merge, then restore_index_overlay puts the local copy back.
+checkout_index_overlay() {
+  local src="$1" dest="$2"
+  [[ -f "$dest/flags.tsv" ]] || return 0
+  local flag path
+  while IFS=$'\t' read -r flag path; do
+    [[ -n "$path" ]] || continue
+    git_c "$src" update-index --no-skip-worktree -- "$path"
+    git_c "$src" update-index --no-assume-unchanged -- "$path"
+    git_c "$src" checkout -- "$path"
+  done <"$dest/flags.tsv"
+}
+
 git_rollback() {
   local src="$1" old_sha="$2" debug="$3"
   local env_file="$src/.env" env_bak="" overlay
@@ -794,6 +808,16 @@ run_wg_update() {
   local merge_out overlay
   overlay="$(mktemp -d)"
   save_index_overlay "$src" "$overlay"
+  if ! checkout_index_overlay "$src" "$overlay"; then
+    restore_index_overlay "$src" "$overlay"
+    rm -rf "$overlay"
+    result="failed"
+    detail="could not check out tracked copies of skip-worktree files before merge"
+    step_log "$debug" 4 "$total" merge FAIL
+    append_history "$(build_history_json "$ts" "$host" "$kind" "$source" "$base_since" "$base_sha" "$old_sha" "$new_sha" "$result" "$detail" "$commits_raw" "$steps_json" "$rb_json")"
+    debug_log "$debug" "$detail"
+    return 1
+  fi
   if ! merge_out="$(git_c "$src" merge --ff-only origin/main 2>&1)"; then
     restore_index_overlay "$src" "$overlay"
     rm -rf "$overlay"
