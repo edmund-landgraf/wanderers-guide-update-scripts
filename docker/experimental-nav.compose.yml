@@ -1,0 +1,47 @@
+# Merged onto the Wanderer's Guide frontend at container start.
+# Not part of Quzzar's repo. update-wg-non-content copies this to
+# docker-compose.override.yml when that file is absent or already this inject.
+services:
+  frontend:
+    command:
+      - sh
+      - -c
+      - |
+        cat > /usr/share/nginx/html/wgui-nav.js << 'EOF'
+        (function () {
+          var host = location.hostname;
+          var href = (host === "localhost" || host === "127.0.0.1")
+            ? "http://localhost:5194"
+            : "https://wgui.wandersguide.site";
+          function inject() {
+            if (!document.body) return;
+            var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            var n;
+            while ((n = walker.nextNode())) {
+              if (n.textContent.trim() !== "Legacy Site") continue;
+              var el = n.parentElement;
+              if (!el) continue;
+              var next = el.nextElementSibling;
+              if (next && next.getAttribute("data-wgui-nav") === "1") continue;
+              var a = document.createElement("a");
+              a.href = href;
+              a.textContent = "Experimental";
+              a.className = el.className;
+              a.setAttribute("data-wgui-nav", "1");
+              el.insertAdjacentElement("afterend", a);
+            }
+          }
+          function start() {
+            inject();
+            new MutationObserver(inject).observe(document.body, {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            });
+          }
+          if (document.body) start();
+          else document.addEventListener("DOMContentLoaded", start);
+        })();
+        EOF
+        grep -q '/wgui-nav.js' /usr/share/nginx/html/index.html || sed -i 's|</head>|<script src="/wgui-nav.js" defer></script></head>|' /usr/share/nginx/html/index.html
+        exec nginx -g 'daemon off;'
