@@ -73,7 +73,7 @@ WG_UPDATE_LOG_DIR="$HOME/logs/wg-update" \
   --force
 ```
 
-Application updates rebuild the frontend image only:
+Application updates rebuild the frontend image only. The Experimental header link is `docker/experimental-nav.compose.yml`. A non-content run copies it to `docker-compose.override.yml` in the Wanderer's Guide checkout when that file is missing or is already this inject, and passes it as an extra `-f` on the frontend recreate. On localhost the link goes to `http://localhost:5194`. On any other host, including amba, it goes to `https://wgui.wandersguide.site`. A run with no new commits still installs the file; pass `--force` to recreate the container.
 
 ```bash
 cd ~/wanderers-guide

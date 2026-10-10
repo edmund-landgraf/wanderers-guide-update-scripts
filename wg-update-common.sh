@@ -446,6 +446,41 @@ apply_pending_migrations() {
   return 0
 }
 
+nav_compose_file() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  printf '%s\n' "$here/docker/experimental-nav.compose.yml"
+}
+
+# Copy the Experimental nav inject into the WG checkout when override.yml is
+# absent or is already this inject. A different local override is left alone;
+# frontend up/rollback still pass the compose file explicitly.
+install_experimental_nav() {
+  local src="$1" debug="${2:-}"
+  local nav dest
+  nav="$(nav_compose_file)"
+  dest="$src/docker-compose.override.yml"
+  [[ -f "$nav" ]] || return 0
+  if [[ -f "$dest" ]] && ! grep -q 'wgui-nav.js' "$dest"; then
+    [[ -n "$debug" ]] && debug_log "$debug" "leave existing docker-compose.override.yml; nav compose is passed with -f"
+    return 0
+  fi
+  cp "$nav" "$dest"
+  [[ -n "$debug" ]] && debug_log "$debug" "installed experimental nav override"
+}
+
+compose_frontend() {
+  local src="$1"
+  shift
+  local nav
+  nav="$(nav_compose_file)"
+  if [[ -f "$nav" ]]; then
+    docker compose -f "$src/docker-compose.yml" -f "$nav" --project-directory "$src" "$@"
+  else
+    docker compose -f "$src/docker-compose.yml" --project-directory "$src" "$@"
+  fi
+}
+
 frontend_image() {
   local src="$1"
   local id
@@ -460,7 +495,7 @@ frontend_rollback() {
   if [[ -n "$prev_name" ]]; then
     docker tag wg-frontend-prev:local "$prev_name" 2>&1 | tee -a "$debug" || true
   fi
-  docker compose -f "$src/docker-compose.yml" --project-directory "$src" up -d --no-build frontend 2>&1 | tee -a "$debug"
+  compose_frontend "$src" up -d --no-build frontend 2>&1 | tee -a "$debug"
 }
 
 build_history_json() {
@@ -789,6 +824,9 @@ run_wg_update() {
     else
       detail="content-only-or-empty"
     fi
+    if [[ "$kind" == "non-content" ]]; then
+      install_experimental_nav "$src" "$debug"
+    fi
     append_history "$(build_history_json "$ts" "$host" "$kind" "$source" "$base_since" "$base_sha" "$old_sha" "$new_sha" "$result" "$detail" "$commits_raw" "$steps_json" "$rb_json")"
     debug_log "$debug" "skipped: $detail"
     return 0
@@ -893,8 +931,9 @@ run_wg_update() {
     if [[ -n "$prev_id" ]]; then
       docker tag "$prev_id" wg-frontend-prev:local 2>&1 | tee -a "$debug" || true
     fi
+    install_experimental_nav "$src" "$debug"
     set +e
-    apply_out="$(docker compose -f "$src/docker-compose.yml" --project-directory "$src" up -d --build frontend 2>&1)"
+    apply_out="$(compose_frontend "$src" up -d --build frontend 2>&1)"
     apply_code=$?
     set -e
     printf '%s\n' "$apply_out"
