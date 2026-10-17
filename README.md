@@ -12,9 +12,17 @@ The scripts are intended to separate **official content updates** from **applica
 - `wg-update-common.sh` — shared update, state, backup, Git, and database helper functions.
 - `wg-reload-official-content.sh` — swaps official catalog rows only (does not drop `public`). After a committed swap it will not restore the pre-apply dump or `git reset` to the old SHA.
 
-## Installation
+## Where this repo lives
 
-Clone this repository on the same Linux host as your Wanderer's Guide checkout:
+| Place | Path |
+| --- | --- |
+| Edit / git on Windows | `D:\repos\edmund-landgraf\wanderers-guide-update-scripts` |
+| Production (vps-ahhh) | `~/wg-update-scripts` (this clone) |
+| WG Docker stack on vps-ahhh | `~/wanderers-guide` (pass as `--src`) |
+
+The scripts repo and the Wanderer's Guide compose checkout are different directories. `--src` always points at the compose checkout.
+
+## Installation on vps-ahhh
 
 ```bash
 git clone https://github.com/edmund-landgraf/wanderers-guide-update-scripts.git ~/wg-update-scripts
@@ -22,13 +30,17 @@ cd ~/wg-update-scripts
 chmod +x *.sh
 ```
 
-Assume Wanderer's Guide itself is installed at:
+If you omit `--src` and `WG_SRC`, the scripts use `../wanderers-guide` (sibling of this clone) or `~/wanderers-guide` when that directory is a git checkout with `docker-compose.yml`.
 
-```text
-~/wanderers-guide
+### Windows PowerShell (WSL bash)
+
+`bash` from PowerShell is usually WSL, so `D:/repos/...` is not a path. Use `/mnt/d/...`, omit `--src` (sibling checkout), or rely on the scripts converting `D:/...` after you pull this change.
+
+```powershell
+cd D:\repos\edmund-landgraf\wanderers-guide-update-scripts
+bash ./update-wg-content.sh --src /mnt/d/repos/edmund-landgraf/wanderers-guide --yes
+bash ./update-wg-non-content.sh --src /mnt/d/repos/edmund-landgraf/wanderers-guide --yes
 ```
-
-You can use any location by supplying `--src`.
 
 ## Content update
 
@@ -128,4 +140,4 @@ Do not substitute a destructive full database initialization for the protected o
 
 ## Current repository status
 
-This repository includes the four Linux scripts (`update-wg-content.sh`, `update-wg-non-content.sh`, `wg-update-common.sh`, `wg-reload-official-content.sh`). On a host where Wanderer's Guide is at `/opt/wanderers-guide`, use `--src /opt/wanderers-guide`.
+This repository includes the four Linux scripts (`update-wg-content.sh`, `update-wg-non-content.sh`, `wg-update-common.sh`, `wg-reload-official-content.sh`). Push from Windows, pull on vps-ahhh into `~/wg-update-scripts`, then run against `~/wanderers-guide`. Logs default to `$HOME/logs/wg-update`.

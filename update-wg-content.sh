@@ -2,11 +2,11 @@
 # Catch-up: swap official book content (spells, sources, etc.) since last apply.
 # Does not drop public. User/character/homebrew rows are kept. Failed apply restores a pg_dump.
 #
-#   ./scripts/linux/update-wg-content.sh --src /opt/wanderers-guide
-#   ./scripts/linux/update-wg-content.sh --src /opt/wanderers-guide --yes
-#   ./scripts/linux/update-wg-content.sh --src /opt/wanderers-guide --force
-#   ./scripts/linux/update-wg-content.sh --src /opt/wanderers-guide --since 2026-08-02
-#   ./scripts/linux/update-wg-content.sh --src /opt/wanderers-guide --repair-grants
+# Production (vps-ahhh): ~/wg-update-scripts/update-wg-content.sh --src ~/wanderers-guide
+#   ./update-wg-content.sh --src "$HOME/wanderers-guide" --yes
+#   ./update-wg-content.sh --src "$HOME/wanderers-guide" --force
+#   ./update-wg-content.sh --src "$HOME/wanderers-guide" --since 2026-08-02
+#   ./update-wg-content.sh --repair-grants
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SRC" ]]; then
-  SRC="$(amba_root)/scripts/_wg-src"
+  SRC="$(default_wg_src)"
 fi
 
 if [[ "$REPAIR_GRANTS" == "1" ]]; then

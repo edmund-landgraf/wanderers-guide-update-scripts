@@ -2,23 +2,58 @@
 # Shared helpers for update-wg-content.sh and update-wg-non-content.sh
 set -euo pipefail
 
-amba_root() {
-  local here
-  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  cd "$here/../.." && pwd
+# This repo (wanderers-guide-update-scripts) is not the WG Docker stack.
+# Local edit copy: D:\repos\edmund-landgraf\wanderers-guide-update-scripts
+# Production: ~/wg-update-scripts on vps-ahhh.
+# --src is the wanderers-guide compose checkout, not this scripts repo.
+# Override with --src or WG_SRC. Else sibling ../wanderers-guide, else ~/wanderers-guide.
+# PowerShell often passes D:/...; WSL bash needs /mnt/d/..., Git Bash needs /d/...
+resolve_wg_src() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || { echo "WG source path is empty" >&2; return 1; }
+  p="${p//\\//}"
+  if [[ "$p" =~ ^([A-Za-z]):/(.*)$ ]]; then
+    local drive rest wsl gitbash
+    drive="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+    rest="${BASH_REMATCH[2]}"
+    wsl="/mnt/${drive}/${rest}"
+    gitbash="/${drive}/${rest}"
+    if [[ -d "$wsl" ]]; then
+      p="$wsl"
+    elif [[ -d "$gitbash" ]]; then
+      p="$gitbash"
+    fi
+  fi
+  if [[ ! -d "$p" ]]; then
+    echo "WG source not found: $1 (resolved $p)" >&2
+    return 1
+  fi
+  (cd "$p" && pwd)
 }
 
-# When scripts live in AdventureMakerByAct/scripts/linux, logs go in that repo.
-# When copied to ~/wg-update-scripts on the WG box, use $HOME/logs/wg-update.
+default_wg_src() {
+  if [[ -n "${WG_SRC:-}" ]]; then
+    resolve_wg_src "$WG_SRC"
+    return
+  fi
+  local scripts_dir sibling
+  scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  sibling="$(cd "$scripts_dir/.." && pwd)/wanderers-guide"
+  local c
+  for c in "$sibling" "${HOME}/wanderers-guide"; do
+    if [[ -d "$c/.git" && -f "$c/docker-compose.yml" ]]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  echo "No wanderers-guide checkout found next to this repo or in \$HOME. Pass --src." >&2
+  return 1
+}
+
+# Logs next to the operator home (on vps-ahhh: ~/logs/wg-update). Override with WG_UPDATE_LOG_DIR.
 log_dir() {
   if [[ -n "${WG_UPDATE_LOG_DIR:-}" ]]; then
     printf '%s\n' "$WG_UPDATE_LOG_DIR"
-    return 0
-  fi
-  local root
-  root="$(amba_root)"
-  if [[ -f "$root/package.json" && -d "$root/src" ]]; then
-    printf '%s\n' "$root/logs/wg-update"
     return 0
   fi
   printf '%s\n' "${HOME}/logs/wg-update"
@@ -84,7 +119,7 @@ assert_git_src() {
   local src="$1"
   [[ -d "$src" ]] || { echo "WG source not found: $src" >&2; return 1; }
   [[ -d "$src/.git" ]] || {
-    echo "Not a git checkout (no .git): $src. Clone wanderers-guide or restore .git in _wg-src." >&2
+    echo "Not a git checkout (no .git): $src. Pass --src to the production wanderers-guide clone." >&2
     return 1
   }
   git_c "$src" remote get-url origin >/dev/null
@@ -715,7 +750,7 @@ PY
 
 repair_wg_grants() {
   local src="$1"
-  src="$(cd "$src" && pwd)"
+  src="$(resolve_wg_src "$src")"
   local here
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   printf 'Repairing GoTrue / PostgREST grants (no content swap)...\n'
@@ -730,11 +765,7 @@ run_wg_update() {
     *) echo "Invalid update kind: $kind" >&2; return 2 ;;
   esac
   assert_update_prereqs "$kind"
-  if [[ -z "$src" || ! -d "$src" ]]; then
-    echo "WG source not found: $src" >&2
-    return 1
-  fi
-  src="$(cd "$src" && pwd)"
+  src="$(resolve_wg_src "$src")"
   local dir debug
   dir="$(init_log_dir)"
   debug="$dir/debug-${kind}.log"

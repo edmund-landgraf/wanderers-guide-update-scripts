@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Catch-up: rebuild WG frontend for non-dump commits since last apply or compose date.
 #
-#   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide
-#   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --force
-#   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --yes
-#   ./scripts/linux/update-wg-non-content.sh --src /opt/wanderers-guide --since 2026-08-02
+# Production (vps-ahhh): ~/wg-update-scripts/update-wg-non-content.sh --src ~/wanderers-guide
+#   ./update-wg-non-content.sh --src "$HOME/wanderers-guide" --force
+#   ./update-wg-non-content.sh --src "$HOME/wanderers-guide" --yes
+#   ./update-wg-non-content.sh --src "$HOME/wanderers-guide" --since 2026-08-02
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SRC" ]]; then
-  SRC="$(amba_root)/scripts/_wg-src"
+  SRC="$(default_wg_src)"
 fi
 
 run_wg_update "$SRC" non-content "$FORCE" "$SINCE" "$YES"
