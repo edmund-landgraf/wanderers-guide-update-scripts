@@ -1,0 +1,443 @@
+From 19e9b81fee563c27c98a40186f312e1e28704ca3 Mon Sep 17 00:00:00 2001
+From: edmund-landgraf <114525624+edmund-landgraf@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 15:50:11 -0700
+Subject: [PATCH 1/3] Require a user JWT or API key on every function except
+ public content reads
+
+connect() now rejects calls with no token, the anon key, or an unverifiable JWT unless the endpoint opts in with allowAnonymous (content lookups, search-data, get-content-versions, get-content-source-stats). API keys work only on character endpoints and are scoped to characters granted to that client and owned by the key's user; find-character list calls are narrowed to that grant set.
+---
+ supabase/functions/_shared/caller-auth.ts     | 107 ++++++++++++++++++
+ supabase/functions/_shared/helpers.ts         |  61 +++++-----
+ .../functions/find-ability-block/index.ts     |   2 +-
+ supabase/functions/find-ancestry/index.ts     |   2 +-
+ supabase/functions/find-archetype/index.ts    |   2 +-
+ supabase/functions/find-background/index.ts   |   2 +-
+ supabase/functions/find-character/index.ts    |   2 +-
+ .../functions/find-class-archetype/index.ts   |   2 +-
+ supabase/functions/find-class/index.ts        |   2 +-
+ .../functions/find-content-source/index.ts    |   2 +-
+ supabase/functions/find-creature/index.ts     |   2 +-
+ supabase/functions/find-item/index.ts         |   2 +-
+ supabase/functions/find-language/index.ts     |   2 +-
+ supabase/functions/find-spell/index.ts        |   2 +-
+ supabase/functions/find-trait/index.ts        |   2 +-
+ .../find-versatile-heritage/index.ts          |   2 +-
+ .../get-content-source-stats/index.ts         |   2 +-
+ .../functions/get-content-versions/index.ts   |   2 +-
+ supabase/functions/search-data/index.ts       |   2 +-
+ 19 files changed, 152 insertions(+), 50 deletions(-)
+ create mode 100644 supabase/functions/_shared/caller-auth.ts
+
+diff --git a/supabase/functions/_shared/caller-auth.ts b/supabase/functions/_shared/caller-auth.ts
+new file mode 100644
+index 00000000..e4d4e26c
+--- /dev/null
++++ b/supabase/functions/_shared/caller-auth.ts
+@@ -0,0 +1,107 @@
++// Caller authentication shared by helpers.connect() and wgui-export's connect-raw.
++// Every endpoint requires a verified user JWT or a valid API key unless it opts in
++// with allowAnonymous (public game-content reads only).
++import { SupabaseClient, createClient } from '@supabase/supabase-js';
++import { jwtVerify, decodeJwt } from 'npm:jose@5.9.6';
++import { HttpError } from './http-errors.ts';
++import type { Character, PublicUser } from './content';
++
++export type CallerKind = 'user' | 'service' | 'anonymous';
++
++function jwtSecret(): string | undefined {
++  // @ts-ignore
++  return Deno.env.get('SB_JWT_SECRET') ?? Deno.env.get('JWT_SECRET') ?? undefined;
++}
++
++const AUTH_REQUIRED = () =>
++  new HttpError(401, 'Authentication required. Send a user session JWT or an API key.', 'AUTH_REQUIRED');
++
++/**
++ * Classify a non-API-key bearer token. Throws 401 for a missing/invalid token unless
++ * the endpoint allows anonymous callers (then the anon key and no token both pass).
++ */
++export async function authenticateBearer(
++  token: string,
++  allowAnonymous: boolean
++): Promise<CallerKind> {
++  if (!token) {
++    if (allowAnonymous) return 'anonymous';
++    throw AUTH_REQUIRED();
++  }
++
++  let claims: Record<string, any>;
++  const secret = jwtSecret();
++  try {
++    if (secret) {
++      ({ payload: claims } = await jwtVerify(token, new TextEncoder().encode(secret)));
++    } else {
++      throw new Error('no HS256 secret');
++    }
++  } catch {
++    // Projects on asymmetric signing keys: let GoTrue validate the session instead.
++    const unverified = (() => {
++      try {
++        return decodeJwt(token) as Record<string, any>;
++      } catch {
++        return null;
++      }
++    })();
++    if (!unverified || unverified.role !== 'authenticated') throw AUTH_REQUIRED();
++    const authClient = createClient(
++      // @ts-ignore
++      Deno.env.get('SUPABASE_URL') ?? '',
++      // @ts-ignore
++      Deno.env.get('SUPABASE_ANON_KEY') ?? ''
++    );
++    const { data, error } = await authClient.auth.getUser(token);
++    if (error || !data?.user) throw AUTH_REQUIRED();
++    return 'user';
++  }
++
++  if (claims.role === 'service_role') return 'service';
++  if (claims.role === 'authenticated' && typeof claims.sub === 'string' && claims.sub) return 'user';
++  if (allowAnonymous) return 'anonymous';
++  throw AUTH_REQUIRED();
++}
++
++/**
++ * Characters an API client may touch: granted to this client by this public user in
++ * details.api_clients.client_access, AND owned by the key's user.
++ */
++export async function grantedCharacterIds(
++  adminClient: SupabaseClient<any, 'public', any>,
++  publicUser: PublicUser,
++  apiClientId: string
++): Promise<number[]> {
++  const { data, error } = await adminClient
++    .from('character')
++    .select('id, user_id, details')
++    .eq('user_id', publicUser.user_id);
++  if (error) throw new HttpError(500, 'Failed to resolve API grants.', 'GRANT_LOOKUP_FAILED');
++  return ((data ?? []) as Character[])
++    .filter((c) =>
++      (c.details?.api_clients?.client_access ?? []).some(
++        (g: any) => g.clientId === apiClientId && g.publicUserId === `${publicUser.id}`
++      )
++    )
++    .map((c) => c.id)
++    .sort((a, b) => a - b);
++}
++
++/**
++ * Scope a character-API request body to the grant set. Returns the body to pass on,
++ * or throws 403 when a specific id is requested that is not granted.
++ */
++export function scopeBodyToGrants<T>(body: T, granted: number[], scopeList: boolean): T {
++  const b = (body ?? {}) as Record<string, any>;
++  const set = new Set(granted);
++  if (typeof b.id === 'number') {
++    if (!set.has(b.id)) throw new HttpError(403, 'You do not have access to this character', 'CHARACTER_FORBIDDEN');
++    return body;
++  }
++  if (!scopeList) return body;
++  const requested: number[] | null = Array.isArray(b.id) ? b.id.filter((x: any) => typeof x === 'number') : null;
++  const ids = requested ? requested.filter((x) => set.has(x)) : granted;
++  // fetchData treats an empty/missing id as "no filter", so never pass []: -1 matches nothing.
++  return { ...b, id: ids.length > 0 ? ids : [-1] } as T;
++}
+diff --git a/supabase/functions/_shared/helpers.ts b/supabase/functions/_shared/helpers.ts
+index 600accd0..1edd28c9 100644
+--- a/supabase/functions/_shared/helpers.ts
++++ b/supabase/functions/_shared/helpers.ts
+@@ -6,9 +6,9 @@ import { HttpError, isAuthenticationError, readJsonBody } from './http-errors.ts
+ import _ from 'lodash';
+ // @ts-ignore
+ import { SignJWT } from 'npm:jose@5.9.6';
++import { authenticateBearer, grantedCharacterIds, scopeBodyToGrants } from './caller-auth.ts';
+ import type {
+   AbilityBlockType,
+-  Character,
+   ContentSource,
+   ContentType,
+   JSendResponse,
+@@ -43,6 +43,10 @@ export async function connect<T = Record<string, any>>(
+   ) => Promise<JSendResponse>,
+   options?: {
+     supportsCharacterAPI?: boolean;
++    /** Public game-content reads: no token or the anon key is accepted. Everything else needs a user JWT or API key. */
++    allowAnonymous?: boolean;
++    /** API-key list calls (no numeric id) are narrowed to the client's granted characters. */
++    scopeCharacterList?: boolean;
+     /**
+      * Skip the JWT / API-key auth routing. Use for service-to-service endpoints
+      * (e.g. Discord webhooks) whose Authorization header carries a shared secret
+@@ -114,11 +118,14 @@ export async function connect<T = Record<string, any>>(
+         body,
+         executeFn,
+         options?.supportsCharacterAPI,
+-        rlHeaders
++        rlHeaders,
++        !!options?.allowAnonymous,
++        !!options?.scopeCharacterList
+       );
+       //
+     } else {
+       // Normal JWT request (or bypassAuth: shared-secret webhook).
++      if (!options?.bypassAuth) await authenticateBearer(token, !!options?.allowAnonymous);
+ 
+       const supabaseClient = createClient(
+         // Supabase API URL - env var exported by default.
+@@ -196,7 +203,9 @@ async function handleApiRouting<T = Record<string, any>>(
+     token: string
+   ) => Promise<JSendResponse>,
+   supportsCharacterAPI?: boolean,
+-  rlHeaders: Record<string, string> = {}
++  rlHeaders: Record<string, string> = {},
++  allowAnonymous = false,
++  scopeCharacterList = false
+ ): Promise<Response> {
+   const adminClient = createClient(
+     // @ts-ignore
+@@ -247,37 +256,23 @@ async function handleApiRouting<T = Record<string, any>>(
+   // The user ID to create the Supabase client for.
+   let userId = publicUser.user_id;
+ 
+-  // If we're hitting a character endpoint and they've given access, use the character owner's user ID instead.
+-  if (
+-    supportsCharacterAPI &&
+-    (body as Record<string, any>)?.id &&
+-    typeof (body as Record<string, any>).id === 'number'
+-  ) {
+-    const characters = await fetchData<Character>(adminClient, 'character', [
+-      { column: 'id', value: (body as Record<string, any>).id },
+-    ]);
+-    const character = characters.find((c) =>
+-      c.details?.api_clients?.client_access.find(
+-        (c) => c.clientId === apiClient.id && c.publicUserId === `${publicUser.id}`
+-      )
++  if (!supportsCharacterAPI && !allowAnonymous) {
++    // An API key is a character-API credential, not a full session for its owner.
++    return new Response(
++      JSON.stringify({
++        status: 'fail',
++        data: { message: 'API keys can only be used with character endpoints.' },
++      } satisfies JSendResponse),
++      {
++        headers: { ...corsHeaders, ...rlHeaders, 'Content-Type': 'application/json' },
++        status: 403,
++      }
+     );
+-
+-    if (!character) {
+-      return new Response(
+-        JSON.stringify({
+-          status: 'fail',
+-          data: {
+-            message: 'You do not have access to this character',
+-          },
+-        } satisfies JSendResponse),
+-        {
+-          headers: { ...corsHeaders, ...rlHeaders, 'Content-Type': 'application/json' },
+-          status: 403,
+-        }
+-      );
+-    }
+-
+-    userId = character.user_id;
++  }
++  if (supportsCharacterAPI) {
++    // Only characters granted to THIS client and owned by the key's user.
++    const granted = await grantedCharacterIds(adminClient, publicUser, apiClient.id);
++    body = scopeBodyToGrants(body, granted, !!scopeCharacterList);
+   }
+ 
+   const { data: userData, error: errorUser } = await adminClient.auth.admin.getUserById(userId);
+diff --git a/supabase/functions/find-ability-block/index.ts b/supabase/functions/find-ability-block/index.ts
+index 08e09493..3a1bb407 100644
+--- a/supabase/functions/find-ability-block/index.ts
++++ b/supabase/functions/find-ability-block/index.ts
+@@ -29,5 +29,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-ancestry/index.ts b/supabase/functions/find-ancestry/index.ts
+index 3a1dac63..8698d126 100644
+--- a/supabase/functions/find-ancestry/index.ts
++++ b/supabase/functions/find-ancestry/index.ts
+@@ -20,5 +20,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-archetype/index.ts b/supabase/functions/find-archetype/index.ts
+index 22891890..bcb3e4ce 100644
+--- a/supabase/functions/find-archetype/index.ts
++++ b/supabase/functions/find-archetype/index.ts
+@@ -23,5 +23,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-background/index.ts b/supabase/functions/find-background/index.ts
+index 72642780..2526f5b1 100644
+--- a/supabase/functions/find-background/index.ts
++++ b/supabase/functions/find-background/index.ts
+@@ -20,5 +20,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-character/index.ts b/supabase/functions/find-character/index.ts
+index 1fdd88d1..db52c541 100644
+--- a/supabase/functions/find-character/index.ts
++++ b/supabase/functions/find-character/index.ts
+@@ -38,6 +38,6 @@ serve(async (req: Request) => {
+         data: results.sort((a, b) => a.id - b.id),
+       };
+     },
+-    { supportsCharacterAPI: true }
++    { supportsCharacterAPI: true, scopeCharacterList: true }
+   );
+ });
+diff --git a/supabase/functions/find-class-archetype/index.ts b/supabase/functions/find-class-archetype/index.ts
+index 74660b7a..691c85b8 100644
+--- a/supabase/functions/find-class-archetype/index.ts
++++ b/supabase/functions/find-class-archetype/index.ts
+@@ -23,5 +23,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-class/index.ts b/supabase/functions/find-class/index.ts
+index 92a6e067..e8389f42 100644
+--- a/supabase/functions/find-class/index.ts
++++ b/supabase/functions/find-class/index.ts
+@@ -20,5 +20,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-content-source/index.ts b/supabase/functions/find-content-source/index.ts
+index 5dcc8e77..8e8c0099 100644
+--- a/supabase/functions/find-content-source/index.ts
++++ b/supabase/functions/find-content-source/index.ts
+@@ -35,5 +35,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-creature/index.ts b/supabase/functions/find-creature/index.ts
+index 324943ba..c7bbf5ae 100644
+--- a/supabase/functions/find-creature/index.ts
++++ b/supabase/functions/find-creature/index.ts
+@@ -29,5 +29,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-item/index.ts b/supabase/functions/find-item/index.ts
+index 81a2a76c..11fd805b 100644
+--- a/supabase/functions/find-item/index.ts
++++ b/supabase/functions/find-item/index.ts
+@@ -23,5 +23,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-language/index.ts b/supabase/functions/find-language/index.ts
+index 8e10bcb4..a10035fc 100644
+--- a/supabase/functions/find-language/index.ts
++++ b/supabase/functions/find-language/index.ts
+@@ -23,5 +23,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-spell/index.ts b/supabase/functions/find-spell/index.ts
+index 5b9949b5..240c4695 100644
+--- a/supabase/functions/find-spell/index.ts
++++ b/supabase/functions/find-spell/index.ts
+@@ -25,5 +25,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-trait/index.ts b/supabase/functions/find-trait/index.ts
+index 43fb43e8..6a21111f 100644
+--- a/supabase/functions/find-trait/index.ts
++++ b/supabase/functions/find-trait/index.ts
+@@ -39,5 +39,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     }
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/find-versatile-heritage/index.ts b/supabase/functions/find-versatile-heritage/index.ts
+index 15972330..705c0581 100644
+--- a/supabase/functions/find-versatile-heritage/index.ts
++++ b/supabase/functions/find-versatile-heritage/index.ts
+@@ -23,5 +23,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data,
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/get-content-source-stats/index.ts b/supabase/functions/get-content-source-stats/index.ts
+index f2dade99..013c358c 100644
+--- a/supabase/functions/get-content-source-stats/index.ts
++++ b/supabase/functions/get-content-source-stats/index.ts
+@@ -38,5 +38,5 @@ serve(async (req: Request) => {
+         count,
+       },
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/get-content-versions/index.ts b/supabase/functions/get-content-versions/index.ts
+index 461d0096..2b2625bf 100644
+--- a/supabase/functions/get-content-versions/index.ts
++++ b/supabase/functions/get-content-versions/index.ts
+@@ -47,5 +47,5 @@ serve(async (req: Request) => {
+       status: 'success',
+       data: data ?? [],
+     };
+-  });
++  }, { allowAnonymous: true });
+ });
+diff --git a/supabase/functions/search-data/index.ts b/supabase/functions/search-data/index.ts
+index ca5035e1..a74693c6 100644
+--- a/supabase/functions/search-data/index.ts
++++ b/supabase/functions/search-data/index.ts
+@@ -75,7 +75,7 @@ serve(async (req: Request) => {
+     } else {
+       return await handleSimpleSearch(client, text || '', content_sources);
+     }
+-  });
++  }, { allowAnonymous: true });
+ });
+ 
+ /// Advanced search token handlers
+-- 
+2.49.0.windows.1
+

@@ -1,0 +1,566 @@
+From d567e430974ebe980b19dfd6741fcffda9a4088a Mon Sep 17 00:00:00 2001
+From: edmund-landgraf <114525624+edmund-landgraf@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:24:17 -0700
+Subject: [PATCH 3/3] Add the admin Players functions and the audit read model.
+
+Staff can list players and open characters only after the server checks the admin password, and player emails stay masked unless an admin reveals one.
+---
+ supabase/functions/_shared/admin-access.ts    | 95 +++++++++++++++++++
+ supabase/functions/_shared/helpers.ts         |  4 +-
+ .../functions/admin-get-character/index.ts    | 37 ++++++++
+ .../admin-get-player-characters/index.ts      | 39 ++++++++
+ .../functions/admin-list-players/index.ts     | 46 +++++++++
+ .../functions/admin-reveal-email/index.ts     | 30 ++++++
+ supabase/functions/admin-unlock/index.ts      | 41 ++++++++
+ .../20261026000000_admin_players.sql          | 92 ++++++++++++++++++
+ .../20261026120000_admin_players_sort.sql     | 88 +++++++++++++++++
+ 9 files changed, 471 insertions(+), 1 deletion(-)
+ create mode 100644 supabase/functions/_shared/admin-access.ts
+ create mode 100644 supabase/functions/admin-get-character/index.ts
+ create mode 100644 supabase/functions/admin-get-player-characters/index.ts
+ create mode 100644 supabase/functions/admin-list-players/index.ts
+ create mode 100644 supabase/functions/admin-reveal-email/index.ts
+ create mode 100644 supabase/functions/admin-unlock/index.ts
+ create mode 100644 supabase/migrations/20261026000000_admin_players.sql
+ create mode 100644 supabase/migrations/20261026120000_admin_players_sort.sql
+
+diff --git a/supabase/functions/_shared/admin-access.ts b/supabase/functions/_shared/admin-access.ts
+new file mode 100644
+index 00000000..c4f4aca8
+--- /dev/null
++++ b/supabase/functions/_shared/admin-access.ts
+@@ -0,0 +1,95 @@
++import type { SupabaseClient } from '@supabase/supabase-js';
++import { getPublicUser } from './helpers.ts';
++import { HttpError } from './http-errors.ts';
++
++/**
++ * Admin screens (WGUI /admin -> Players). The admin password is the ONLY admin gate: there is
++ * no is_admin / staff check. The caller must still be a signed-in, non-deactivated account so
++ * unlock tokens can be bound to a user id and failures can be rate-limited and audited.
++ */
++export async function requireSignedInUser(client: SupabaseClient<any, 'public', any>, token: string) {
++  const user = await getPublicUser(client, token, { rejectAnonymous: true });
++  if (!user || user.deactivated) {
++    throw new HttpError(401, 'Sign in to use the admin panel.', 'AUTH_REQUIRED');
++  }
++  return user;
++}
++// ---- Admin panel password unlock ---------------------------------------------------------
++// The password lives only in the functions env (ADMIN_PANEL_PASSWORD). Unlock tokens are
++// HMAC-signed with a key derived from JWT_SECRET + the password, so changing the password
++// invalidates every outstanding token. Tokens are bound to the signed-in user's id.
++
++export const ADMIN_UNLOCK_TTL_SECONDS = 8 * 60 * 60;
++const enc = new TextEncoder();
++
++function b64url(bytes: Uint8Array): string {
++  let s = '';
++  for (const b of bytes) s += String.fromCharCode(b);
++  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++}
++
++/** Constant-time comparison of two strings (compares SHA-256 digests so length leaks nothing). */
++export async function timingSafeEqualStr(a: string, b: string): Promise<boolean> {
++  const [da, db] = await Promise.all([
++    crypto.subtle.digest('SHA-256', enc.encode(a)),
++    crypto.subtle.digest('SHA-256', enc.encode(b)),
++  ]);
++  const x = new Uint8Array(da);
++  const y = new Uint8Array(db);
++  let diff = 0;
++  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
++  return diff === 0;
++}
++
++export function adminPanelPassword(): string | null {
++  // @ts-ignore Deno global
++  const value = (Deno.env.get('ADMIN_PANEL_PASSWORD') ?? '').trim();
++  return value.length > 0 ? value : null;
++}
++
++async function unlockKey(): Promise<CryptoKey> {
++  const password = adminPanelPassword();
++  // @ts-ignore Deno global
++  const jwtSecret = Deno.env.get('JWT_SECRET') ?? '';
++  if (!password || !jwtSecret) throw new HttpError(503, 'Admin panel is not configured.', 'ADMIN_NOT_CONFIGURED');
++  const base = await crypto.subtle.importKey('raw', enc.encode(jwtSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
++  const derived = new Uint8Array(await crypto.subtle.sign('HMAC', base, enc.encode(`admin-unlock-v1:${password}`)));
++  return crypto.subtle.importKey('raw', derived, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
++}
++
++async function sign(payload: string): Promise<string> {
++  return b64url(new Uint8Array(await crypto.subtle.sign('HMAC', await unlockKey(), enc.encode(payload))));
++}
++
++export async function issueAdminUnlockToken(userId: string): Promise<{ token: string; expires_at: number }> {
++  const exp = Math.floor(Date.now() / 1000) + ADMIN_UNLOCK_TTL_SECONDS;
++  const payload = b64url(enc.encode(JSON.stringify({ sub: userId, exp, v: 1 })));
++  return { token: `${payload}.${await sign(payload)}`, expires_at: exp };
++}
++
++/** Throws 401 ADMIN_LOCKED unless `token` is a valid, unexpired unlock token for `userId`. */
++export async function requireAdminUnlock(userId: string, token: unknown) {
++  const locked = () => new HttpError(401, 'Admin panel is locked. Enter the admin password.', 'ADMIN_LOCKED');
++  if (typeof token !== 'string' || token.length > 512) throw locked();
++  const [payload, signature] = token.split('.');
++  if (!payload || !signature) throw locked();
++  if (!(await timingSafeEqualStr(signature, await sign(payload)))) throw locked();
++  let claims: { sub?: string; exp?: number };
++  try {
++    claims = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
++  } catch {
++    throw locked();
++  }
++  if (claims.sub !== userId || typeof claims.exp !== 'number' || claims.exp < Date.now() / 1000) throw locked();
++}
++
++/** Signed-in user + valid unlock token (sent as body.admin_unlock; custom headers are not in the shared CORS allow-list). */
++export async function requireUnlockedAdmin(
++  client: SupabaseClient<any, 'public', any>,
++  token: string,
++  body: unknown
++) {
++  const user = await requireSignedInUser(client, token);
++  await requireAdminUnlock(user.user_id, (body as any)?.admin_unlock);
++  return user;
++}
+diff --git a/supabase/functions/_shared/helpers.ts b/supabase/functions/_shared/helpers.ts
+index 1edd28c9..e245725d 100644
+--- a/supabase/functions/_shared/helpers.ts
++++ b/supabase/functions/_shared/helpers.ts
+@@ -800,7 +800,9 @@ export async function insertData<T = Record<string, any>>(
+ 
+   const { data: insertedData, error } = await client.from(tableName).insert(data).select();
+   if (error) {
+-    if (error.code === '23505' && hasUUID(tableName)) {
++    const duplicateText = `${error.message ?? ''} ${error.details ?? ''}`;
++    const duplicateUuid = error.code === '23505' && hasUUID(tableName) && duplicateText.includes('uuid');
++    if (duplicateUuid) {
+       // Duplicate UUID, delete the old one and try again
+       /* NOTE: Disable overriding existing uploaded content for now */
+       // const { error } = await client.from(tableName).delete().eq('uuid', data.uuid);
+diff --git a/supabase/functions/admin-get-character/index.ts b/supabase/functions/admin-get-character/index.ts
+new file mode 100644
+index 00000000..0d33beb1
+--- /dev/null
++++ b/supabase/functions/admin-get-character/index.ts
+@@ -0,0 +1,37 @@
++// @ts-ignore
++import { serve } from 'std/server';
++import { connect, createServiceClient } from '../_shared/helpers.ts';
++import { requireUnlockedAdmin } from '../_shared/admin-access.ts';
++import { HttpError } from '../_shared/http-errors.ts';
++
++serve(async (req: Request) => {
++  return await connect(req, async (client, body, token) => {
++    await requireUnlockedAdmin(client, token, body);
++    const id = Number((body as { character_id?: number })?.character_id);
++    if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'character_id must be a positive integer', 'INVALID_REQUEST');
++
++    const service = createServiceClient();
++    const { data: c, error } = await service
++      .from('character')
++      .select('id, user_id, name, level, experience, hp_current, hp_temp, hero_points, campaign_id, created_at, updated_at, details, inventory, notes, spells, companions')
++      .eq('id', id)
++      .maybeSingle();
++    if (error) return { status: 'error', message: 'Failed to load character' };
++    if (!c) throw new HttpError(404, 'Character not found', 'NOT_FOUND');
++
++    const { data: owner } = await service
++      .from('public_user')
++      .select('display_name')
++      .eq('user_id', (c as any).user_id)
++      .maybeSingle();
++    let campaign_name: string | null = null;
++    if ((c as any).campaign_id) {
++      const { data: camp } = await service.from('campaign').select('name').eq('id', (c as any).campaign_id).maybeSingle();
++      campaign_name = (camp as any)?.name ?? null;
++    }
++    return {
++      status: 'success',
++      data: { character: c, owner_display_name: (owner as any)?.display_name ?? null, campaign_name },
++    };
++  });
++});
+\ No newline at end of file
+diff --git a/supabase/functions/admin-get-player-characters/index.ts b/supabase/functions/admin-get-player-characters/index.ts
+new file mode 100644
+index 00000000..bf21ce52
+--- /dev/null
++++ b/supabase/functions/admin-get-player-characters/index.ts
+@@ -0,0 +1,39 @@
++// @ts-ignore
++import { serve } from 'std/server';
++import { connect, createServiceClient } from '../_shared/helpers.ts';
++import { requireUnlockedAdmin } from '../_shared/admin-access.ts';
++import { HttpError } from '../_shared/http-errors.ts';
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++serve(async (req: Request) => {
++  return await connect(req, async (client, body, token) => {
++    await requireUnlockedAdmin(client, token, body);
++    const { user_id } = (body ?? {}) as { user_id?: string };
++    if (!user_id || !UUID.test(user_id)) throw new HttpError(400, 'user_id must be a uuid', 'INVALID_REQUEST');
++
++    // Owned PCs only (Decision D1).
++    const { data, error } = await createServiceClient()
++      .from('character')
++      .select('id, user_id, name, level, campaign_id, updated_at, details')
++      .eq('user_id', user_id)
++      .order('updated_at', { ascending: false });
++    if (error) return { status: 'error', message: 'Failed to load characters' };
++
++    const characters = (data ?? []).map((c: any) => ({
++      id: c.id,
++      user_id: c.user_id,
++      name: c.name,
++      level: c.level,
++      campaign_id: c.campaign_id,
++      updated_at: c.updated_at,
++      ancestry: c.details?.ancestry?.name ?? null,
++      heritage: c.details?.heritage?.name ?? null,
++      background: c.details?.background?.name ?? null,
++      class: c.details?.class?.name ?? null,
++      class_2: c.details?.class_2?.name ?? null,
++      image_url: c.details?.image_url ?? null,
++    }));
++    return { status: 'success', data: characters };
++  });
++});
+\ No newline at end of file
+diff --git a/supabase/functions/admin-list-players/index.ts b/supabase/functions/admin-list-players/index.ts
+new file mode 100644
+index 00000000..59e13224
+--- /dev/null
++++ b/supabase/functions/admin-list-players/index.ts
+@@ -0,0 +1,46 @@
++// @ts-ignore
++import { serve } from 'std/server';
++import { connect, createServiceClient } from '../_shared/helpers.ts';
++import { requireUnlockedAdmin } from '../_shared/admin-access.ts';
++
++const SORTABLE = new Set(['name', 'email', 'login', 'tier', 'pcs', 'campaigns', 'last_login']);
++
++serve(async (req: Request) => {
++  return await connect(req, async (client, body, token) => {
++    await requireUnlockedAdmin(client, token, body);
++    const { page, page_size, query, tier, provider, sort, direction } = (body ?? {}) as {
++      sort?: string;
++      direction?: string;
++      page?: number;
++      page_size?: number;
++      query?: string;
++      tier?: string;
++      provider?: string;
++    };
++    const size = Math.min(Math.max(Number(page_size) || 50, 1), 100);
++    const pageNum = Math.max(Number(page) || 0, 0);
++
++    const { data, error } = await createServiceClient().rpc('admin_player_overview', {
++      p_limit: size,
++      p_offset: pageNum * size,
++      p_query: typeof query === 'string' ? query.trim().slice(0, 200) : null,
++      p_tier: typeof tier === 'string' ? tier : null,
++      p_provider: typeof provider === 'string' ? provider : null,
++      p_sort: typeof sort === 'string' && SORTABLE.has(sort) ? sort : null,
++      p_dir: direction === 'desc' ? 'desc' : 'asc',
++    });
++    if (error) {
++      return { status: 'error', message: 'Failed to load players' };
++    }
++    const rows = (data ?? []) as Array<Record<string, any>>;
++    return {
++      status: 'success',
++      data: {
++        page: pageNum,
++        page_size: size,
++        total: rows.length > 0 ? Number(rows[0].total_count) : 0,
++        players: rows.map(({ total_count, ...rest }) => rest),
++      },
++    };
++  });
++});
+\ No newline at end of file
+diff --git a/supabase/functions/admin-reveal-email/index.ts b/supabase/functions/admin-reveal-email/index.ts
+new file mode 100644
+index 00000000..d5d3e3eb
+--- /dev/null
++++ b/supabase/functions/admin-reveal-email/index.ts
+@@ -0,0 +1,30 @@
++// @ts-ignore
++import { serve } from 'std/server';
++import { connect, createServiceClient } from '../_shared/helpers.ts';
++import { requireUnlockedAdmin } from '../_shared/admin-access.ts';
++import { HttpError } from '../_shared/http-errors.ts';
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++serve(async (req: Request) => {
++  return await connect(req, async (client, body, token) => {
++    // Email reveal is admin-only even if moderators are allowed on the screens (Decision D4).
++    const actor = await requireUnlockedAdmin(client, token, body);
++    const { user_id } = (body ?? {}) as { user_id?: string };
++    if (!user_id || !UUID.test(user_id)) throw new HttpError(400, 'user_id must be a uuid', 'INVALID_REQUEST');
++
++    const service = createServiceClient();
++    const { data, error } = await service.auth.admin.getUserById(user_id);
++    if (error || !data?.user) throw new HttpError(404, 'User not found', 'NOT_FOUND');
++
++    // Audit first; fail closed if the audit row can't be written.
++    const { error: auditError } = await service.from('admin_audit_log').insert({
++      actor_user_id: actor.user_id,
++      action: 'reveal_email',
++      target_user_id: user_id,
++    });
++    if (auditError) return { status: 'error', message: 'Audit log unavailable' };
++
++    return { status: 'success', data: { user_id, email: data.user.email ?? null } };
++  });
++});
+\ No newline at end of file
+diff --git a/supabase/functions/admin-unlock/index.ts b/supabase/functions/admin-unlock/index.ts
+new file mode 100644
+index 00000000..e30d4908
+--- /dev/null
++++ b/supabase/functions/admin-unlock/index.ts
+@@ -0,0 +1,41 @@
++// @ts-ignore
++import { serve } from 'std/server';
++import { connect, createServiceClient } from '../_shared/helpers.ts';
++import { adminPanelPassword, issueAdminUnlockToken, requireSignedInUser, timingSafeEqualStr } from '../_shared/admin-access.ts';
++import { HttpError } from '../_shared/http-errors.ts';
++
++const MAX_FAILURES = 5;
++const WINDOW_MINUTES = 15;
++
++serve(async (req: Request) => {
++  return await connect(req, async (client, body, token) => {
++    const actor = await requireSignedInUser(client, token);
++    const expected = adminPanelPassword();
++    if (!expected) throw new HttpError(503, 'Admin panel is not configured.', 'ADMIN_NOT_CONFIGURED');
++
++    const service = createServiceClient();
++    const since = new Date(Date.now() - WINDOW_MINUTES * 60_000).toISOString();
++    const { count, error: countError } = await service
++      .from('admin_audit_log')
++      .select('id', { count: 'exact', head: true })
++      .eq('actor_user_id', actor.user_id)
++      .eq('action', 'admin_unlock_failed')
++      .gte('created_at', since);
++    if (countError) return { status: 'error', message: 'Audit log unavailable' };
++    if ((count ?? 0) >= MAX_FAILURES) {
++      throw new HttpError(429, `Too many failed attempts. Try again in ${WINDOW_MINUTES} minutes.`, 'RATE_LIMITED');
++    }
++
++    const supplied = typeof (body as any)?.password === 'string' ? ((body as any).password as string).slice(0, 256) : '';
++    const ok = supplied.length > 0 && (await timingSafeEqualStr(supplied, expected));
++    const { error: auditError } = await service.from('admin_audit_log').insert({
++      actor_user_id: actor.user_id,
++      action: ok ? 'admin_unlock' : 'admin_unlock_failed',
++      target_user_id: null,
++    });
++    if (auditError) return { status: 'error', message: 'Audit log unavailable' };
++    if (!ok) throw new HttpError(401, 'Incorrect admin password.', 'BAD_ADMIN_PASSWORD');
++
++    return { status: 'success', data: await issueAdminUnlockToken(actor.user_id) };
++  });
++});
+\ No newline at end of file
+diff --git a/supabase/migrations/20261026000000_admin_players.sql b/supabase/migrations/20261026000000_admin_players.sql
+new file mode 100644
+index 00000000..07c570f1
+--- /dev/null
++++ b/supabase/migrations/20261026000000_admin_players.sql
+@@ -0,0 +1,92 @@
++-- Admin Players screen (WGUI /admin -> Players tab). Fork-owned, admin-only.
++-- Read model for the admin player list plus a service-role-only audit log.
++begin;
++
++create table if not exists public.admin_audit_log (
++  id bigint generated by default as identity primary key,
++  created_at timestamptz not null default now(),
++  actor_user_id uuid not null,
++  action text not null,
++  target_user_id uuid,
++  meta jsonb
++);
++alter table public.admin_audit_log enable row level security;
++revoke all on table public.admin_audit_log from anon, authenticated;
++grant select, insert on table public.admin_audit_log to service_role;
++
++create or replace function public.admin_mask_email(p_email text)
++returns text language sql immutable set search_path = '' as $fn$
++  select case
++    when p_email is null or position('@' in p_email) = 0 then null
++    else left(split_part(p_email, '@', 1), 2) || '***@' || split_part(p_email, '@', 2)
++  end
++$fn$;
++
++create or replace function public.admin_player_overview(
++  p_limit integer default 50,
++  p_offset integer default 0,
++  p_query text default null,
++  p_tier text default null,
++  p_provider text default null
++)
++returns table (
++  user_id uuid,
++  display_name text,
++  image_url text,
++  masked_email text,
++  providers text[],
++  patreon_tier text,
++  is_capped boolean,
++  is_admin boolean,
++  is_mod boolean,
++  deactivated boolean,
++  pc_count bigint,
++  created_at timestamptz,
++  last_sign_in_at timestamptz,
++  total_count bigint
++)
++language sql stable security definer set search_path = '' as $fn$
++  with base as (
++    select
++      pu.user_id,
++      pu.display_name::text as display_name,
++      pu.image_url::text as image_url,
++      public.admin_mask_email(u.email::text) as masked_email,
++      coalesce((select array_agg(distinct i.provider order by i.provider) from auth.identities i where i.user_id = pu.user_id), '{}') as providers,
++      nullif(pu.patreon ->> 'tier', '') as patreon_tier,
++      not (
++        coalesce(pu.patreon ->> 'tier', '') in ('WANDERER', 'LEGEND', 'GAME-MASTER')
++        or coalesce(pu.patreon -> 'game_master' -> 'virtual_tier' ->> 'game_master_user_id', '') <> ''
++        or coalesce(pu.is_community_paragon, false)
++        or coalesce(pu.is_developer, false)
++      ) as is_capped,
++      pu.is_admin,
++      pu.is_mod,
++      pu.deactivated,
++      (select count(*) from public."character" c where c.user_id = pu.user_id) as pc_count,
++      pu.created_at,
++      u.last_sign_in_at
++    from public.public_user pu
++    left join auth.users u on u.id = pu.user_id
++  ), filtered as (
++    select * from base b
++    where (p_query is null or p_query = ''
++           or b.display_name ilike '%' || p_query || '%'
++           or b.user_id::text = p_query
++           or exists (select 1 from auth.users u2 where u2.id = b.user_id and u2.email ilike '%' || p_query || '%'))
++      and (p_tier is null or p_tier = '' or (p_tier = 'NONE' and b.patreon_tier is null) or b.patreon_tier = p_tier)
++      and (p_provider is null or p_provider = '' or p_provider = any(b.providers))
++  )
++  select f.*, count(*) over () as total_count
++  from filtered f
++  order by f.created_at desc, f.user_id
++  limit greatest(1, least(coalesce(p_limit, 50), 100))
++  offset greatest(0, coalesce(p_offset, 0))
++$fn$;
++
++revoke all on function public.admin_player_overview(integer, integer, text, text, text) from public, anon, authenticated;
++grant execute on function public.admin_player_overview(integer, integer, text, text, text) to service_role;
++revoke all on function public.admin_mask_email(text) from public, anon, authenticated;
++grant execute on function public.admin_mask_email(text) to service_role;
++
++commit;
+\ No newline at end of file
+diff --git a/supabase/migrations/20261026120000_admin_players_sort.sql b/supabase/migrations/20261026120000_admin_players_sort.sql
+new file mode 100644
+index 00000000..9bf6fdfa
+--- /dev/null
++++ b/supabase/migrations/20261026120000_admin_players_sort.sql
+@@ -0,0 +1,88 @@
++-- Admin Players: add campaign_count + whitelisted server-side sorting (p_sort/p_dir).
++begin;
++
++drop function if exists public.admin_player_overview(integer, integer, text, text, text);
++
++create function public.admin_player_overview(
++  p_limit integer default 50,
++  p_offset integer default 0,
++  p_query text default null,
++  p_tier text default null,
++  p_provider text default null,
++  p_sort text default null,
++  p_dir text default null
++)
++returns table (
++  user_id uuid,
++  display_name text,
++  image_url text,
++  masked_email text,
++  providers text[],
++  patreon_tier text,
++  is_capped boolean,
++  is_admin boolean,
++  is_mod boolean,
++  deactivated boolean,
++  pc_count bigint,
++  campaign_count bigint,
++  created_at timestamptz,
++  last_sign_in_at timestamptz,
++  total_count bigint
++)
++language sql stable security definer set search_path = '' as $fn$
++  with base as (
++    select
++      pu.user_id,
++      pu.display_name::text as display_name,
++      pu.image_url::text as image_url,
++      public.admin_mask_email(u.email::text) as masked_email,
++      coalesce((select array_agg(distinct i.provider order by i.provider) from auth.identities i where i.user_id = pu.user_id), '{}') as providers,
++      nullif(pu.patreon ->> 'tier', '') as patreon_tier,
++      not (
++        coalesce(pu.patreon ->> 'tier', '') in ('WANDERER', 'LEGEND', 'GAME-MASTER')
++        or coalesce(pu.patreon -> 'game_master' -> 'virtual_tier' ->> 'game_master_user_id', '') <> ''
++        or coalesce(pu.is_community_paragon, false)
++        or coalesce(pu.is_developer, false)
++      ) as is_capped,
++      pu.is_admin,
++      pu.is_mod,
++      pu.deactivated,
++      (select count(*) from public."character" c where c.user_id = pu.user_id) as pc_count,
++      (select count(*) from public.campaign cp where cp.user_id = pu.user_id) as campaign_count,
++      pu.created_at,
++      u.last_sign_in_at
++    from public.public_user pu
++    left join auth.users u on u.id = pu.user_id
++  ), filtered as (
++    select * from base b
++    where (p_query is null or p_query = ''
++           or b.display_name ilike '%' || p_query || '%'
++           or b.user_id::text = p_query
++           or exists (select 1 from auth.users u2 where u2.id = b.user_id and u2.email ilike '%' || p_query || '%'))
++      and (p_tier is null or p_tier = '' or (p_tier = 'NONE' and b.patreon_tier is null) or b.patreon_tier = p_tier)
++      and (p_provider is null or p_provider = '' or p_provider = any(b.providers))
++  )
++  select f.*, count(*) over () as total_count
++  from filtered f
++  order by
++    -- Whitelisted sort keys only; anything else falls back to created_at desc. No dynamic SQL.
++    case when lower(coalesce(p_dir, 'asc')) <> 'desc' then case p_sort
++      when 'name' then lower(f.display_name) when 'email' then lower(f.masked_email)
++      when 'login' then array_to_string(f.providers, ',') when 'tier' then f.patreon_tier end end asc nulls last,
++    case when lower(coalesce(p_dir, 'asc')) = 'desc' then case p_sort
++      when 'name' then lower(f.display_name) when 'email' then lower(f.masked_email)
++      when 'login' then array_to_string(f.providers, ',') when 'tier' then f.patreon_tier end end desc nulls last,
++    case when lower(coalesce(p_dir, 'asc')) <> 'desc' then case p_sort
++      when 'pcs' then f.pc_count when 'campaigns' then f.campaign_count end end asc nulls last,
++    case when lower(coalesce(p_dir, 'asc')) = 'desc' then case p_sort
++      when 'pcs' then f.pc_count when 'campaigns' then f.campaign_count end end desc nulls last,
++    case when p_sort = 'last_login' and lower(coalesce(p_dir, 'asc')) <> 'desc' then f.last_sign_in_at end asc nulls last,
++    case when p_sort = 'last_login' and lower(coalesce(p_dir, 'asc')) = 'desc' then f.last_sign_in_at end desc nulls last,
++    f.created_at desc, f.user_id
++  limit greatest(1, least(coalesce(p_limit, 50), 100))
++  offset greatest(0, coalesce(p_offset, 0))
++$fn$;
++
++revoke all on function public.admin_player_overview(integer, integer, text, text, text, text, text) from public, anon, authenticated;
++grant execute on function public.admin_player_overview(integer, integer, text, text, text, text, text) to service_role;
++commit;
+-- 
+2.49.0.windows.1
+

@@ -1,0 +1,49 @@
+From 56e9a36d817a34a89f4a3a03c52f30dfbfd4eab3 Mon Sep 17 00:00:00 2001
+From: edmund-landgraf <114525624+edmund-landgraf@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:04:39 -0700
+Subject: [PATCH 2/3] Add private-fork README explaining held-back auth fix and
+ plans
+
+---
+ PRIVATE-FORK-README.md | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+ create mode 100644 PRIVATE-FORK-README.md
+
+diff --git a/PRIVATE-FORK-README.md b/PRIVATE-FORK-README.md
+new file mode 100644
+index 00000000..bbeacdb7
+--- /dev/null
++++ b/PRIVATE-FORK-README.md
+@@ -0,0 +1,29 @@
++﻿# Private copy of wanderers-guide: why it exists
++
++This private repository holds a security fix that is deliberately **not yet published** to the public upstream (`wanderers-guide/wanderers-guide`).
++
++## Why
++The Supabase edge functions had an unauthenticated data-exposure bug:
++
++- The functions gateway runs with `VERIFY_JWT=false`, and `connect()` in `supabase/functions/_shared/helpers.ts` let anonymous callers through.
++- As a result, `POST /functions/v1/find-character` with no auth header returned public character data (stats, inventory, etc.).
++- API keys ran with their owner's full rights instead of being limited to characters granted to that key.
++
++The fix is held back from the public upstream until Edmund's production deployment (amba.wandersguide.site) is patched.
++
++## What the fix does (branch `security/function-auth`)
++- Every function now requires a valid user JWT or a valid API client key, except explicitly public content reads.
++- Missing or invalid credentials return **401**.
++- An API key can read only characters owned by its user **and** granted to that client (`details.api_clients.client_access`).
++- Normal signed-in user access is unchanged.
++
++## Plans going forward
++1. Deploy to prod via the VPS Prod operator, with before/after curl smoke tests (no-auth -> 401, bad key -> 401, valid key -> only granted PCs, normal login still works).
++2. Check `SB_JWT_SECRET` on prod, and whether prod uses asymmetric JWT signing keys.
++3. Optionally enable `VERIFY_JWT` at the gateway as defense in depth.
++4. Trade-off: signed-out visitors can no longer load public sheets via `find-character`; consider a dedicated public-only read path.
++5. Tell API key users (e.g. the Foundry import module) about the behaviour change.
++6. Possibly upstream the fix responsibly after prod is patched.
++7. Admin-panel work remains uncommitted locally for now and is not part of this branch.
++
++No secrets or keys are stored in this repository.
+-- 
+2.49.0.windows.1
+
